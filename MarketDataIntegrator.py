@@ -1,7 +1,7 @@
 from typing import Dict, List
 import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, NewsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import asyncio
 import json
@@ -12,9 +12,15 @@ from dotenv import load_dotenv
 import os
 import ssl
 import websocket
+import aiohttp
+import pandas as pd
+from alpaca.data import DataFeed
+from indicators import TechnicalIndicators
+import pytz
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class MarketDataIntegrator:
     def __init__(self):
@@ -36,27 +42,61 @@ class MarketDataIntegrator:
         self.connected = False
         self.loop = None
         
+        # Dow Jones symbols
+        self.dow_symbols = [
+            "AAPL", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "DOW",
+            "GS", "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM",
+            "MRK", "MSFT", "NKE", "PG", "TRV", "UNH", "V", "VZ", "WBA", "WMT"
+        ]
+
+        self.news_cache = []
+        self.last_news_update = None
+        self.NEWS_CACHE_DURATION = timedelta(minutes=5)  # Cache for 5 minutes
+
     async def get_stock_data(self, symbol: str) -> Dict:
-        """
-        Smart data fetching with cache and API limit management
-        """
+        """Get stock data with fallback to last closing price"""
         cache_key = f"stock_data:{symbol}"
         
         # Try cache first
         cached_data = self.redis_client.get(cache_key)
         if cached_data:
             return json.loads(cached_data)
+        
+        try:
+            # Get data from yfinance when market is closed
+            print(f"Fetching data for {symbol}...")  # Debug log
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1d")
             
-        # Determine best source based on API limits
-        if self.can_use_alpaca():
-            data = await self.fetch_alpaca_data(symbol)
-            self.alpaca_calls += 1
-        else:
-            data = await self.fetch_yahoo_data(symbol)
-            
-        # Cache the result
-        self.redis_client.setex(cache_key, 300, json.dumps(data))  # 5 min cache
-        return data
+            print(f"Data received for {symbol}: {not hist.empty}")  # Debug log
+            if not hist.empty:
+                last_row = hist.iloc[-1]
+                print(f"Last row for {symbol}: {last_row}")  # Debug log
+                
+                data = {
+                    "symbol": symbol,
+                    "price": float(last_row['Close']),
+                    "open": float(last_row['Open']),
+                    "high": float(last_row['High']),
+                    "low": float(last_row['Low']),
+                    "volume": int(last_row['Volume']),
+                    "change": float(last_row['Close'] - last_row['Open']),
+                    "change_percent": float((last_row['Close'] - last_row['Open']) / last_row['Open'] * 100),
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                # Cache for 5 minutes
+                self.redis_client.setex(cache_key, 300, json.dumps(data))
+                return data
+                
+        except Exception as e:
+            print(f"Detailed error for {symbol}: {str(e)}")  # Debug log
+            return {
+                "symbol": symbol,
+                "price": None,
+                "volume": None,
+                "timestamp": datetime.now().isoformat()
+            }
     
     def can_use_alpaca(self) -> bool:
         """Check if we can use Alpaca API based on rate limits"""
@@ -264,111 +304,380 @@ class MarketDataIntegrator:
         except Exception as e:
             print(f"Error processing quote: {e}")
 
-    async def get_historical_bars(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> List[Dict]:
-        """
-        Get historical bar data for a symbol
-        """
-        cache_key = f"historical_bars:{symbol}:{timeframe}:{start.date()}:{end.date()}"
+    async def get_historical_bars(self, symbol: str, timeframe: str = "1D", ndays: int = 30) -> list:
+        """Get historical price bars for a symbol"""
+        try:
+            ticker = yf.Ticker(symbol)
+            
+            # Default to daily data if no timeframe specified
+            interval = {
+                "1Min": "1m",
+                "5Min": "5m",
+                "1H": "1h",
+                "1D": "1d"
+            }.get(timeframe, "1d")
+            
+            # For daily data, use proper period format
+            if timeframe == "1D":
+                period = {
+                    1: "1d",
+                    5: "5d",
+                    30: "1mo",
+                    90: "3mo",
+                    180: "6mo",
+                    365: "1y"
+                }.get(ndays, "1mo")
+            else:
+                period = f"{ndays}d"
+                
+            logger.info(f"Fetching {symbol} with interval={interval}, period={period}")
+            hist = ticker.history(period=period, interval=interval)
+            
+            if hist.empty:
+                logger.error(f"No historical data found for {symbol}")
+                return []
+                
+            # Format the data as a list of bars
+            bars = []
+            for index, row in hist.iterrows():
+                bars.append({
+                    "timestamp": index.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+                    "open": round(float(row['Open']), 4),
+                    "high": round(float(row['High']), 4),
+                    "low": round(float(row['Low']), 4),
+                    "close": round(float(row['Close']), 4),
+                    "volume": int(row['Volume'])
+                })
+                
+            return bars
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            logger.exception("Full traceback:")
+            return []
+
+    async def get_latest_bars(self, symbols: List[str]) -> Dict:
+        """Get latest minute bars for multiple symbols using IEX"""
+        cache_key = f"latest_bars:{','.join(symbols)}"
         
         # Try cache first
-        cached_data = self.redis_client.get(cache_key)
-        if cached_data:
-            self.logger.info(f"Cache hit for historical data: {symbol}")
-            return json.loads(cached_data)
-        
-        self.logger.info(f"Fetching historical data for {symbol}")
+        cached = self.redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
         
         try:
-            # Validate timeframe format according to API docs
-            valid_timeframes = ['1Min', '5Min', '15Min', '1Hour', '1Day']
-            if timeframe not in valid_timeframes:
-                raise ValueError(f"Invalid timeframe. Must be one of {valid_timeframes}")
+            # Get bars from Alpaca with IEX feed
+            bars = self.alpaca_client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=symbols,
+                    timeframe=TimeFrame.Minute,
+                    start=datetime.now(timezone.utc) - timedelta(minutes=5),
+                    feed='iex'  # Changed to string 'iex' instead of DataFeed.IEX
+                )
+            )
             
-            # Validate dates
-            if end > datetime.now():
-                end = datetime.now()
-            if start > end:
-                raise ValueError("Start date must be before end date")
+            result = {}
+            for symbol in symbols:
+                if symbol in bars:
+                    symbol_bars = bars[symbol]
+                    if len(symbol_bars) > 0:
+                        latest = symbol_bars[-1]
+                        result[symbol] = {
+                            "open": float(latest.open),
+                            "high": float(latest.high),
+                            "low": float(latest.low),
+                            "close": float(latest.close),
+                            "volume": int(latest.volume),
+                            "timestamp": latest.timestamp.isoformat()
+                        }
             
-            # Map timeframes to amount and TimeFrameUnit
-            timeframe_map = {
-                '1Min': (1, TimeFrameUnit.Minute),
-                '5Min': (5, TimeFrameUnit.Minute),
-                '15Min': (15, TimeFrameUnit.Minute),
-                '1Hour': (1, TimeFrameUnit.Hour),
-                '1Day': (1, TimeFrameUnit.Day)
+            # Cache for 30 seconds
+            self.redis_client.setex(cache_key, 30, json.dumps(result))
+            return result
+            
+        except Exception as e:
+            print(f"Error getting bars: {e}")
+            return {}
+
+    async def get_top_gainers(self) -> List[Dict]:
+        """Get top 50 gaining stocks"""
+        cache_key = "top_gainers"
+        cached = self.redis_client.get(cache_key)
+        
+        if cached:
+            return json.loads(cached)
+            
+        try:
+            # Get market data for all tracked symbols
+            gainers = []
+            symbols = await self.get_market_symbols()
+            
+            for symbol in symbols[:100]:  # Limit initial scan
+                data = await self.get_stock_data(symbol)
+                if data and data.get('change_percent'):
+                    gainers.append(data)
+            
+            # Sort by percentage gain and get top 50
+            gainers.sort(key=lambda x: x['change_percent'], reverse=True)
+            top_gainers = gainers[:50]
+            
+            # Cache for 5 minutes
+            self.redis_client.setex(cache_key, 300, json.dumps(top_gainers))
+            return top_gainers
+            
+        except Exception as e:
+            print(f"Error getting top gainers: {e}")
+            return []
+
+    async def get_top_losers(self) -> List[Dict]:
+        """Get top 50 losing stocks"""
+        cache_key = "top_losers"
+        cached = self.redis_client.get(cache_key)
+        
+        if cached:
+            return json.loads(cached)
+            
+        try:
+            # Similar to gainers but sort ascending
+            losers = []
+            symbols = await self.get_market_symbols()
+            
+            for symbol in symbols[:100]:
+                data = await self.get_stock_data(symbol)
+                if data and data.get('change_percent'):
+                    losers.append(data)
+            
+            losers.sort(key=lambda x: x['change_percent'])
+            top_losers = losers[:50]
+            
+            self.redis_client.setex(cache_key, 300, json.dumps(top_losers))
+            return top_losers
+            
+        except Exception as e:
+            print(f"Error getting top losers: {e}")
+            return []
+
+    async def get_dow_jones_stocks(self) -> List[Dict]:
+        """Get Dow Jones Industrial Average stocks"""
+        cache_key = "dow_jones"
+        cached = self.redis_client.get(cache_key)
+        
+        if cached:
+            return json.loads(cached)
+            
+        try:
+            dow_data = []
+            for symbol in self.dow_symbols:
+                data = await self.get_stock_data(symbol)
+                if data:
+                    dow_data.append(data)
+            
+            self.redis_client.setex(cache_key, 60, json.dumps(dow_data))  # 1 min cache
+            return dow_data
+            
+        except Exception as e:
+            print(f"Error getting Dow Jones data: {e}")
+            return []
+
+    async def get_trending_news(self) -> list:
+        """Get market news with caching"""
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Return cached news if fresh (less than 5 minutes old)
+            if (self.last_news_update and 
+                self.news_cache and 
+                now - self.last_news_update < self.NEWS_CACHE_DURATION):
+                logger.info("Returning cached news")
+                return self.news_cache
+                
+            # Otherwise fetch new data
+            logger.info("Fetching fresh news")
+            search = yf.Search(query="stock market")
+            market_news = search.news
+            
+            if not market_news:
+                return self.news_cache if self.news_cache else []  # Return old cache if new fetch fails
+                
+            # Process and format news
+            all_news = []
+            for article in market_news:
+                try:
+                    formatted_article = {
+                        "id": str(hash(article['title'])),
+                        "headline": article['title'],
+                        "summary": article.get('summary', ''),
+                        "source": article.get('publisher', 'Yahoo Finance'),
+                        "url": article['link'],
+                        "image_url": article.get('thumbnail', {}).get('resolutions', [{}])[0].get('url', ''),
+                        "timestamp": datetime.fromtimestamp(
+                            article['providerPublishTime'], 
+                            tz=timezone.utc
+                        ).isoformat(),
+                        "category": "Markets",
+                        "tickers": article.get('relatedTickers', [])
+                    }
+                    all_news.append(formatted_article)
+                except KeyError as ke:
+                    logger.error(f"Missing key in article: {ke}")
+                    continue
+            
+            # Update cache
+            self.news_cache = sorted(all_news, key=lambda x: x['timestamp'], reverse=True)[:10]
+            self.last_news_update = now
+            
+            logger.info(f"Updated news cache with {len(self.news_cache)} articles")
+            return self.news_cache
+            
+        except Exception as e:
+            logger.error(f"Error fetching news: {e}")
+            return self.news_cache if self.news_cache else []  # Return old cache on error
+
+    async def get_batch_stock_data(self, symbols: List[str]) -> Dict[str, Dict]:
+        """Get real-time data for multiple symbols"""
+        result = {}
+        tasks = []
+        
+        for symbol in symbols:
+            tasks.append(self.get_stock_data(symbol))
+        
+        data = await asyncio.gather(*tasks)
+        
+        for i, symbol in enumerate(symbols):
+            result[symbol] = data[i]
+            
+        return result
+
+    async def get_market_symbols(self) -> List[str]:
+        """Get list of tradable symbols"""
+        cache_key = "market_symbols"
+        cached = self.redis_client.get(cache_key)
+        
+        if cached:
+            return json.loads(cached)
+            
+        try:
+            # This is a placeholder - implement based on your data source
+            # Could get from Alpaca, Yahoo Finance, or other source
+            symbols = self.dow_symbols  # For now, just return Dow symbols
+            
+            self.redis_client.setex(cache_key, 86400, json.dumps(symbols))  # 24h cache
+            return symbols
+            
+        except Exception as e:
+            print(f"Error getting market symbols: {e}")
+            return []
+
+    async def get_technical_indicators(self, symbol: str) -> dict:
+        """Get technical indicators with analysis"""
+        try:
+            # Get data
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1y")
+            hist.columns = hist.columns.str.lower()
+            
+            # Get current price for reference
+            current_price = hist['close'].iloc[-1]
+            avg_volume = hist['volume'].mean()
+            
+            # Calculate base indicators
+            indicators = TechnicalIndicators.get_all_indicators(hist)
+            
+            # RSI Analysis
+            rsi = indicators['rsi']
+            rsi_signal = {
+                "value": round(rsi, 2),
+                "signal": "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral",
+                "strength": "Strong" if (rsi < 20 or rsi > 80) else "Moderate"
             }
             
-            amount, unit = timeframe_map[timeframe]
+            # MACD Analysis
+            macd_data = indicators['macd']
+            macd_signal = {
+                "value": round(macd_data['macd'], 2),
+                "signal": round(macd_data['signal'], 2),
+                "histogram": round(macd_data['histogram'], 2),
+                "trend": "Bullish" if macd_data['histogram'] > 0 else "Bearish"
+            }
             
-            # Get data from Alpaca
-            request = StockBarsRequest(
-                symbol_or_symbols=[symbol],
-                timeframe=TimeFrame(amount, unit),
-                start=start,
-                end=end,
-                adjustment='raw',
-                feed='sip',
-                limit=1000
-            )
+            # Moving Averages
+            ma_data = indicators['moving_averages']
+            ma50, ma200 = ma_data['ma50'], ma_data['ma200']
+            ma_trend = "Bullish" if ma50 > ma200 else "Bearish"
+            ma_strength = round(abs(ma50 - ma200) / ma200 * 100, 2)
             
-            if not isinstance(self.alpaca_client, StockHistoricalDataClient):
-                self.alpaca_client = StockHistoricalDataClient(
-                    api_key=self.api_key,
-                    secret_key=self.secret_key
-                )
+            ma_signal = {
+                "ma50": round(ma50, 2),
+                "ma200": round(ma200, 2),
+                "trend": ma_trend,
+                "strength": ma_strength
+            }
             
-            bars = self.alpaca_client.get_stock_bars(request)
+            # Volume Analysis
+            current_volume = hist['volume'].iloc[-1]
+            volume_ratio = current_volume / avg_volume
+            volatility = "High" if volume_ratio > 1.5 else "Low" if volume_ratio < 0.5 else "Normal"
             
-            # Convert to list of dictionaries
-            data = []
-            # Get the bars for the specific symbol
-            symbol_bars = bars[symbol]
+            # Determine overall trends
+            short_term_signals = [
+                rsi > 50,  # RSI above midpoint
+                macd_data['histogram'] > 0,  # MACD positive
+                current_volume > avg_volume  # Above average volume
+            ]
             
-            for bar in symbol_bars:
-                data.append({
-                    'timestamp': bar.timestamp.isoformat(),
-                    'open': float(bar.open),
-                    'high': float(bar.high),
-                    'low': float(bar.low),
-                    'close': float(bar.close),
-                    'volume': int(bar.volume)
-                })
+            short_term = "Bullish" if sum(short_term_signals) >= 2 else "Bearish"
             
-            # Cache the result (1 hour for intraday, 1 day for daily)
-            ttl = 3600 if timeframe.endswith('Min') else 86400
-            self.redis_client.setex(cache_key, ttl, json.dumps(data))
-            
-            return data
+            return {
+                "symbol": symbol,
+                "company_name": ticker.info.get('longName', symbol),
+                "current_price": round(current_price, 2),
+                "signals": {
+                    "rsi": rsi_signal,
+                    "macd": macd_signal,
+                    "moving_averages": ma_signal
+                },
+                "summary": {
+                    "short_term": short_term,
+                    "long_term": ma_trend,
+                    "volatility": volatility,
+                    "price_strength": f"{round((current_price / ma200 - 1) * 100, 2)}% vs 200MA"
+                }
+            }
             
         except Exception as e:
-            self.logger.error(f"Error fetching historical data for {symbol}: {e}")
-            raise
+            logger.error(f"Error calculating indicators for {symbol}: {e}")
+            return {}
 
-    async def get_latest_bars(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get latest bars regardless of market status"""
+    async def is_market_open(self) -> bool:
+        """Check if US market is currently open"""
         try:
-            # Try to get from cache first
-            cache_key = f"latest_bars:{symbol}"
-            cached_data = self.redis_client.get(cache_key)
-            if cached_data:
-                return json.loads(cached_data)
-
-            # If not in cache, get historical data
-            end = datetime.now()
-            start = end - timedelta(days=1)  # Get last day's data
+            # Get current time in ET
+            nyc = pytz.timezone('America/New_York')
+            utc_now = datetime.now(pytz.UTC)
+            et_now = utc_now.astimezone(nyc)
             
-            data = await self.get_historical_bars(
-                symbol=symbol,
-                timeframe='1Min',
-                start=start,
-                end=end
-            )
+            # Check if it's a holiday (New Year's Day)
+            if et_now.month == 1 and et_now.day == 1:
+                logger.info("Market closed: New Year's Day")
+                return False
             
-            # Cache the result
-            self.redis_client.setex(cache_key, 60, json.dumps(data))  # 1 minute cache
-            return data
+            # Check if it's a weekday
+            if et_now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+                logger.info(f"Market closed: Weekend ({et_now.strftime('%A')})")
+                return False
+            
+            # Market hours are 9:30 AM - 4:00 PM Eastern
+            market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+            
+            # Check if current time is within market hours
+            is_open = market_open <= et_now <= market_close
+            
+            logger.info(f"Market Status: {'OPEN' if is_open else 'CLOSED'}")
+            logger.info(f"Current time (ET): {et_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            
+            return is_open
             
         except Exception as e:
-            self.logger.error(f"Error getting latest bars for {symbol}: {e}")
-            return []
+            logger.error(f"Error checking market status: {e}")
+            return False

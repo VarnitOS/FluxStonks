@@ -1,9 +1,12 @@
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
-import asyncio
-import json
+import logging
 from MarketDataIntegrator import MarketDataIntegrator
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 mdi = MarketDataIntegrator()
@@ -32,6 +35,76 @@ def is_market_open() -> bool:
     
     return True
 
+@app.get("/")
+async def root():
+    """Root endpoint showing API status and market info."""
+    return {
+        "status": "active",
+        "market_open": is_market_open(),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/stock/{symbol}")
+async def get_stock(symbol: str):
+    """Get current stock data"""
+    try:
+        logger.info(f"Fetching data for symbol: {symbol}")
+        data = await mdi.get_stock_data(symbol)
+        if not data:
+            raise HTTPException(status_code=404, detail=f"No data found for symbol {symbol}")
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching stock data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/bars/{symbols}")
+async def get_bars(symbols: str):
+    """Get latest minute bars for multiple symbols"""
+    try:
+        # Check if market is open
+        market_open = is_market_open()
+        logger.info(f"Market status: {'OPEN' if market_open else 'CLOSED'}")
+        
+        # Get current time in ET
+        now = datetime.now().astimezone()
+        et_hour = (now.hour - 4) % 24  # Simple EST conversion
+        current_time = f"{et_hour:02d}:{now.minute:02d} ET"
+        
+        if not market_open:
+            return {
+                "status": "closed",
+                "current_time": current_time,
+                "message": "Market is closed. Trading hours are 9:30 AM - 4:00 PM ET, Monday-Friday.",
+                "next_open": "9:30 AM ET next trading day",
+                "data": None
+            }
+            
+        # If market is open, get the data
+        logger.info(f"API: Fetching bars for symbols: {symbols}")
+        symbol_list = symbols.split(',')
+        data = await mdi.get_latest_bars(symbol_list)
+        
+        if not data:
+            logger.error(f"API: No data returned for symbols {symbols}")
+            return {
+                "status": "open",
+                "current_time": current_time,
+                "message": f"No data found for symbols: {symbols}",
+                "data": None
+            }
+            
+        logger.info(f"API: Successfully returned data for {len(data)} symbols")
+        return {
+            "status": "open",
+            "current_time": current_time,
+            "message": "Success",
+            "data": data
+        }
+        
+    except Exception as e:
+        logger.error(f"API: Error fetching bars: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/historical/{symbol}")
 async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
     """Get historical bar data for a symbol."""
@@ -43,58 +116,73 @@ async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.websocket("/ws/bars/{symbol}")
-async def websocket_bars(websocket: WebSocket, symbol: str):
-    await websocket.accept()
+@app.get("/api/market/dow")
+async def get_dow():
+    """Get Dow Jones stocks data"""
     try:
-        initial_data = await mdi.get_latest_bars(symbol)
-        await websocket.send_json({
-            "type": "initial",
-            "data": initial_data
-        })
-        
-        market_open = is_market_open()
-        if market_open:
-            await mdi.start_websocket_stream([symbol])
-            
-        while True:
-            try:
-                if market_open:
-                    bar_data = mdi.redis_client.get(f"last_bar:{symbol}")
-                    if bar_data:
-                        await websocket.send_json({
-                            "type": "update",
-                            "data": json.loads(bar_data)
-                        })
-                else:
-                    latest_data = await mdi.get_latest_bars(symbol)
-                    if latest_data:
-                        await websocket.send_json({
-                            "type": "update",
-                            "data": latest_data[-1]
-                        })
-                        
-            except Exception as e:
-                print(f"Error sending update: {e}")
-                
-            await asyncio.sleep(1 if market_open else 60)
-                
+        return await mdi.get_dow_jones_stocks()
     except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        if market_open:
-            await mdi.stop_websocket_stream([symbol])
-        await websocket.close() 
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-async def root():
-    """Root endpoint showing API status and market info."""
-    return {
-        "status": "active",
-        "market_open": is_market_open(),
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": {
-            "historical": "/api/historical/{symbol}",
-            "websocket": "/ws/bars/{symbol}"
+@app.get("/api/market/gainers")
+async def get_gainers():
+    """Get top gainers"""
+    try:
+        return await mdi.get_top_gainers()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/market/losers")
+async def get_losers():
+    """Get top losers"""
+    try:
+        return await mdi.get_top_losers()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/news")
+async def get_news():
+    """Get trending market news"""
+    try:
+        news = await mdi.get_trending_news()
+        
+        if not news:
+            return {
+                "status": "error",
+                "message": "No news articles found",
+                "data": None
+            }
+            
+        return {
+            "status": "success",
+            "message": f"Found {len(news)} news articles",
+            "data": news
         }
-    } 
+        
+    except Exception as e:
+        logger.error(f"Error fetching news: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/indicators/{symbol}")
+async def get_indicators(symbol: str):
+    """Get all technical indicators for a symbol"""
+    try:
+        logger.info(f"Calculating indicators for symbol: {symbol}")
+        data = await mdi.get_technical_indicators(symbol)
+        
+        if not data:
+            return {
+                "status": "error",
+                "message": f"No indicator data found for symbol {symbol}",
+                "data": None
+            }
+            
+        return {
+            "status": "success",
+            "message": "Successfully calculated indicators",
+            "data": data
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) 

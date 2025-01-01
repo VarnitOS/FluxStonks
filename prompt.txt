@@ -1,0 +1,16 @@
+i want to build a frontend using react,jsx which is connected to my backend, i want this homepage to be divided into three rows , 2 of which are from the baove and the last to be a small footer to promote my socials etc,
+
+for the two i want the top row to be divided into 2 divs, the left side to contain three cards which have carasoule features actively dislaying the Dow Jones Industrial companies, top gainers and top losers, each with a smiliar looking chart from the react stockchart library, i want it to look exactly like the one i displayed. and when clicked on, should redirect to a focused page that shows a list of the respective stocks from each list (top 50).
+
+and for the left side i want it to be into 2 more rows, the top one will redirect to a tradingbot/ prediction page i havent designed yet and the bottom one will display trending news from yfinance in a carasoule manner.
+
+
+i want the bottom row to be the same from the picture displaying the same companies and their stock prices, i would like it to have a lot more technical indicators (backend improvement). and the same block chart.
+
+
+the left side should be of the same 3 bubble diagram with top one being green and "market open" or red and "market closed". the middle bubble should be a counter till market opens/closes the bottom one should be live updating todays date and time
+
+
+leave the botttom empty for now.
+
+dont start generating any code just yet, think of improvements and changes i wil need to make. 
