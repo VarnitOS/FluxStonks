@@ -2,20 +2,16 @@ from typing import Dict, List
 import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import asyncio
-import websockets
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import redis
 from dotenv import load_dotenv
 import os
 import ssl
-from alpaca.data.live import StockDataStream
-import websocket  # Add this import at the top
-import _thread
-from functools import partial
+import websocket
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -27,11 +23,7 @@ class MarketDataIntegrator:
             os.getenv("ALPACA_KEY"),
             os.getenv("ALPACA_SECRET")
         )
-        # Initialize WebSocket stream
-        self.stream = StockDataStream(
-            os.getenv("ALPACA_KEY"),
-            os.getenv("ALPACA_SECRET")
-        )
+        
         # Redis for caching
         self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
         self.logger = logging.getLogger(__name__)
@@ -272,18 +264,111 @@ class MarketDataIntegrator:
         except Exception as e:
             print(f"Error processing quote: {e}")
 
-# Example usage
-async def main():
-    integrator = MarketDataIntegrator()
-    symbols = ['AAPL', 'MSFT', 'GOOGL']
-    
-    # Start WebSocket stream in background
-    asyncio.create_task(integrator.start_websocket_stream(symbols))
-    
-    # Get data for symbols
-    for symbol in symbols:
-        data = await integrator.get_stock_data(symbol)
-        print(f"{symbol}: {data}")
+    async def get_historical_bars(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> List[Dict]:
+        """
+        Get historical bar data for a symbol
+        """
+        cache_key = f"historical_bars:{symbol}:{timeframe}:{start.date()}:{end.date()}"
         
-if __name__ == "__main__":
-    asyncio.run(main())
+        # Try cache first
+        cached_data = self.redis_client.get(cache_key)
+        if cached_data:
+            self.logger.info(f"Cache hit for historical data: {symbol}")
+            return json.loads(cached_data)
+        
+        self.logger.info(f"Fetching historical data for {symbol}")
+        
+        try:
+            # Validate timeframe format according to API docs
+            valid_timeframes = ['1Min', '5Min', '15Min', '1Hour', '1Day']
+            if timeframe not in valid_timeframes:
+                raise ValueError(f"Invalid timeframe. Must be one of {valid_timeframes}")
+            
+            # Validate dates
+            if end > datetime.now():
+                end = datetime.now()
+            if start > end:
+                raise ValueError("Start date must be before end date")
+            
+            # Map timeframes to amount and TimeFrameUnit
+            timeframe_map = {
+                '1Min': (1, TimeFrameUnit.Minute),
+                '5Min': (5, TimeFrameUnit.Minute),
+                '15Min': (15, TimeFrameUnit.Minute),
+                '1Hour': (1, TimeFrameUnit.Hour),
+                '1Day': (1, TimeFrameUnit.Day)
+            }
+            
+            amount, unit = timeframe_map[timeframe]
+            
+            # Get data from Alpaca
+            request = StockBarsRequest(
+                symbol_or_symbols=[symbol],
+                timeframe=TimeFrame(amount, unit),
+                start=start,
+                end=end,
+                adjustment='raw',
+                feed='sip',
+                limit=1000
+            )
+            
+            if not isinstance(self.alpaca_client, StockHistoricalDataClient):
+                self.alpaca_client = StockHistoricalDataClient(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key
+                )
+            
+            bars = self.alpaca_client.get_stock_bars(request)
+            
+            # Convert to list of dictionaries
+            data = []
+            # Get the bars for the specific symbol
+            symbol_bars = bars[symbol]
+            
+            for bar in symbol_bars:
+                data.append({
+                    'timestamp': bar.timestamp.isoformat(),
+                    'open': float(bar.open),
+                    'high': float(bar.high),
+                    'low': float(bar.low),
+                    'close': float(bar.close),
+                    'volume': int(bar.volume)
+                })
+            
+            # Cache the result (1 hour for intraday, 1 day for daily)
+            ttl = 3600 if timeframe.endswith('Min') else 86400
+            self.redis_client.setex(cache_key, ttl, json.dumps(data))
+            
+            return data
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching historical data for {symbol}: {e}")
+            raise
+
+    async def get_latest_bars(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """Get latest bars regardless of market status"""
+        try:
+            # Try to get from cache first
+            cache_key = f"latest_bars:{symbol}"
+            cached_data = self.redis_client.get(cache_key)
+            if cached_data:
+                return json.loads(cached_data)
+
+            # If not in cache, get historical data
+            end = datetime.now()
+            start = end - timedelta(days=1)  # Get last day's data
+            
+            data = await self.get_historical_bars(
+                symbol=symbol,
+                timeframe='1Min',
+                start=start,
+                end=end
+            )
+            
+            # Cache the result
+            self.redis_client.setex(cache_key, 60, json.dumps(data))  # 1 minute cache
+            return data
+            
+        except Exception as e:
+            self.logger.error(f"Error getting latest bars for {symbol}: {e}")
+            return []

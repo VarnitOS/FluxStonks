@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Historical Data</title>
+    <style>
+        /* ... existing styles ... */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Stock Historical Data</h1>
+        <div class="search-container">
+            <input type="text" 
+                   id="symbol-input" 
+                   placeholder="Enter stock symbol (e.g., AAPL)"
+                   value="META">
+            <button id="fetch-button">Fetch Data</button>  <!-- Removed onclick -->
+        </div>
+        <div id="loading" class="loading" style="display: none;">Loading data...</div>
+        <table id="data-table">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Open</th>
+                    <th>High</th>
+                    <th>Low</th>
+                    <th>Close</th>
+                    <th>Volume</th>
+                </tr>
+            </thead>
+            <tbody id="data-body"></tbody>
+        </table>
+    </div>
+
+    <script>
+        // Wait for DOM to be ready
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add click event listener to button
+            document.getElementById('fetch-button').addEventListener('click', fetchStockData);
+            
+            // Add enter key listener to input
+            document.getElementById('symbol-input').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    fetchStockData();
+                }
+            });
+
+            // Initial load
+            fetchStockData();
+        });
+
+        async function fetchStockData() {
+            const symbol = document.getElementById('symbol-input').value.toUpperCase();
+            const loadingDiv = document.getElementById('loading');
+            const tbody = document.getElementById('data-body');
+            
+            console.log('Fetching data for:', symbol);
+            
+            loadingDiv.style.display = 'block';
+            tbody.innerHTML = '';
+            
+            try {
+                const response = await fetch(
+                    `http://127.0.0.1:8000/api/historical/${symbol}?timeframe=1Min&days=365`
+                );
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                console.log('Received data:', data);
+                displayData(data);
+            } catch (error) {
+                console.error('Error fetching data:', error);
+                loadingDiv.innerHTML = 'Error loading data. Please try again later.';
+            }
+        }
+
+        function displayData(data) {
+            const tbody = document.getElementById('data-body');
+            document.getElementById('loading').style.display = 'none';
+
+            console.log('Displaying data, length:', data.length);
+
+            data.forEach(bar => {
+                const row = document.createElement('tr');
+                const date = new Date(bar.timestamp).toLocaleDateString();
+                
+                row.innerHTML = `
+                    <td>${date}</td>
+                    <td>${bar.open.toFixed(2)}</td>
+                    <td>${bar.high.toFixed(2)}</td>
+                    <td>${bar.low.toFixed(2)}</td>
+                    <td>${bar.close.toFixed(2)}</td>
+                    <td>${bar.volume.toLocaleString()}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+    </script>
+</body>
+</html>
