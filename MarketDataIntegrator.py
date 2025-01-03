@@ -17,6 +17,7 @@ import pandas as pd
 from alpaca.data import DataFeed
 from indicators import TechnicalIndicators
 import pytz
+from pprint import pformat
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -25,10 +26,17 @@ logger = logging.getLogger(__name__)
 class MarketDataIntegrator:
     def __init__(self):
         # Initialize APIs
-        self.alpaca_client = StockHistoricalDataClient(
-            os.getenv("ALPACA_KEY"),
-            os.getenv("ALPACA_SECRET")
-        )
+        API_KEY = os.getenv("ALPACA_KEY")
+        API_SECRET = os.getenv("ALPACA_SECRET")
+        
+        # Debug log the keys (partially)
+        logger.info(f"Initializing Alpaca client with key: {API_KEY[:5]}...")
+        
+        if not API_KEY or not API_SECRET:
+            logger.error("Missing Alpaca credentials!")
+            return
+            
+        self.client = StockHistoricalDataClient(API_KEY, API_SECRET)
         
         # Redis for caching
         self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -112,7 +120,7 @@ class MarketDataIntegrator:
     async def fetch_alpaca_data(self, symbol: str) -> Dict:
         """Fetch data from Alpaca"""
         try:
-            bars = self.alpaca_client.get_stock_bars(
+            bars = self.client.get_stock_bars(
                 StockBarsRequest(
                     symbol_or_symbols=symbol,
                     timeframe=TimeFrame.Minute,
@@ -304,56 +312,45 @@ class MarketDataIntegrator:
         except Exception as e:
             print(f"Error processing quote: {e}")
 
-    async def get_historical_bars(self, symbol: str, timeframe: str = "1D", ndays: int = 30) -> list:
-        """Get historical price bars for a symbol"""
+    async def get_historical_bars(self, symbol: str, timeframe: str = "1Min", days: int = 1):
         try:
-            ticker = yf.Ticker(symbol)
+            # Convert timeframes
+            if timeframe == "1Min":
+                tf = TimeFrame(1, TimeFrameUnit.Minute)
+            elif timeframe == "5Min":
+                tf = TimeFrame(5, TimeFrameUnit.Minute)
+            elif timeframe == "1H":
+                tf = TimeFrame(1, TimeFrameUnit.Hour)
+            elif timeframe == "1D":
+                tf = TimeFrame(1, TimeFrameUnit.Day)
             
-            # Default to daily data if no timeframe specified
-            interval = {
-                "1Min": "1m",
-                "5Min": "5m",
-                "1H": "1h",
-                "1D": "1d"
-            }.get(timeframe, "1d")
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                feed='iex'
+            )
             
-            # For daily data, use proper period format
-            if timeframe == "1D":
-                period = {
-                    1: "1d",
-                    5: "5d",
-                    30: "1mo",
-                    90: "3mo",
-                    180: "6mo",
-                    365: "1y"
-                }.get(ndays, "1mo")
-            else:
-                period = f"{ndays}d"
-                
-            logger.info(f"Fetching {symbol} with interval={interval}, period={period}")
-            hist = ticker.history(period=period, interval=interval)
+            # Get bars
+            bars = self.client.get_stock_bars(request)
             
-            if hist.empty:
-                logger.error(f"No historical data found for {symbol}")
-                return []
+            # Format response
+            formatted_bars = []
+            if bars and symbol in bars:
+                symbol_bars = bars[symbol]
+                for bar in symbol_bars:
+                    formatted_bars.append({
+                        "timestamp": bar.timestamp.isoformat(),
+                        "open": float(bar.open),
+                        "high": float(bar.high),
+                        "low": float(bar.low),
+                        "close": float(bar.close),
+                        "volume": int(bar.volume)
+                    })
                 
-            # Format the data as a list of bars
-            bars = []
-            for index, row in hist.iterrows():
-                bars.append({
-                    "timestamp": index.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
-                    "open": round(float(row['Open']), 4),
-                    "high": round(float(row['High']), 4),
-                    "low": round(float(row['Low']), 4),
-                    "close": round(float(row['Close']), 4),
-                    "volume": int(row['Volume'])
-                })
-                
-            return bars
+            return formatted_bars
             
         except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            logger.exception("Full traceback:")
+            logger.error(f"Error: {e}")
             return []
 
     async def get_latest_bars(self, symbols: List[str]) -> Dict:
@@ -367,7 +364,7 @@ class MarketDataIntegrator:
         
         try:
             # Get bars from Alpaca with IEX feed
-            bars = self.alpaca_client.get_stock_bars(
+            bars = self.client.get_stock_bars(
                 StockBarsRequest(
                     symbol_or_symbols=symbols,
                     timeframe=TimeFrame.Minute,
