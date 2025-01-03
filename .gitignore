@@ -20,18 +20,25 @@ var/
 .installed.cfg
 *.egg
 
-# Virtual Environment
-venv/
-ENV/
+# Environment variables
+.env
+
+# Node
+node_modules/
+package-lock.json
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
+
+# System
+.DS_Store
+Thumbs.db
 
 # Logs
 *.log
 
-# Environment variables
-.env
+# Test files
+test_*.png
