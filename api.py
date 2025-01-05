@@ -3,30 +3,33 @@ import json
 import logging
 import ssl
 import asyncio
+import statistics
+import time
 from typing import Set, Dict
 import os
 from dotenv import load_dotenv
+import redis
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
-import redis
+from datetime import datetime
 from MarketDataIntegrator import MarketDataIntegrator
+import pytz
 
-# Setup logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+
 load_dotenv()
 ALPACA_KEY = os.getenv("ALPACA_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET")
 ALPACA_STREAM_URL = "wss://stream.data.alpaca.markets/v2/iex"
 
-# Initialize FastAPI and MarketDataIntegrator
+
 app = FastAPI()
 mdi = MarketDataIntegrator()
 
-# Add CORS middleware
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,12 +38,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WebSocket globals
+
 connected_clients: Set[WebSocket] = set()
 client_subscriptions: Dict[WebSocket, Set[str]] = {}
 alpaca_ws = None
 
-# Redis setup
+
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
 CACHE_EXPIRY = 300
 SMOOTHING_WINDOW = 10
@@ -50,10 +53,10 @@ def is_market_open() -> bool:
     """Check if US stock market is currently open."""
     now = datetime.now().astimezone()
     
-    if now.weekday() > 4:  # 5 = Saturday, 6 = Sunday
+    if now.weekday() > 4:
         return False
     
-    et_hour = (now.hour - 4) % 24  # Simple EST conversion (UTC-4)
+    et_hour = (now.hour - 4) % 24
     
     if (et_hour < 9 or et_hour >= 16 or 
         (et_hour == 9 and now.minute < 30)):
@@ -84,55 +87,49 @@ async def get_stock(symbol: str):
         logger.error(f"Error fetching stock data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/bars/{symbols}")
-async def get_bars(symbols: str):
-    """Get latest minute bars for multiple symbols"""
-    try:
-        market_open = is_market_open()
-        now = datetime.now().astimezone()
-        et_hour = (now.hour - 4) % 24
-        current_time = f"{et_hour:02d}:{now.minute:02d} ET"
-        
-        if not market_open:
-            return {
-                "status": "closed",
-                "current_time": current_time,
-                "message": "Market is closed. Trading hours are 9:30 AM - 4:00 PM ET, Monday-Friday.",
-                "next_open": "9:30 AM ET next trading day",
-                "data": None
-            }
-            
-        symbol_list = symbols.split(',')
-        data = await mdi.get_latest_bars(symbol_list)
-        
-        if not data:
-            return {
-                "status": "open",
-                "current_time": current_time,
-                "message": f"No data found for symbols: {symbols}",
-                "data": None
-            }
-            
-        return {
-            "status": "open",
-            "current_time": current_time,
-            "message": "Success",
-            "data": data
-        }
-        
-    except Exception as e:
-        logger.error(f"API: Error fetching bars: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/historical/{symbol}")
 async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
-    """Get historical bar data for a symbol."""
+    """Get historical bar data for a symbol with proper market status."""
     try:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=days)
-        data = await mdi.get_historical_bars(symbol, timeframe, start_dt, end_dt)
-        return data
+
+        et_tz = pytz.timezone('America/New_York')
+        now = datetime.now(et_tz)
+        market_open = now.weekday() < 5 and (
+            (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
+            and now.hour < 16
+        )
+        
+
+        data = await mdi.get_historical_bars(symbol, timeframe, days)
+        
+        if data and len(data) > 0:
+            first_bar = data[0]["timestamp"]
+            last_bar = data[-1]["timestamp"]
+            
+            return {
+                "status": "success",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "bars_count": len(data),
+                "period": {
+                    "start": first_bar,
+                    "end": last_bar
+                },
+                "current_market_status": "open" if market_open else "closed",
+                "data": data
+            }
+        else:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "message": "No data available for the specified period",
+                "current_market_status": "open" if market_open else "closed",
+                "data": []
+            }
+            
     except Exception as e:
+        logger.error(f"Endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/market/dow")
@@ -308,7 +305,6 @@ async def forward_to_clients(message: str):
     if connected_clients:
         for client in connected_clients.copy():
             try:
-                # Get smoothed data instead of raw data
                 if isinstance(json.loads(message), dict):
                     data = json.loads(message)
                     if data.get('T') in ['t', 'q']:

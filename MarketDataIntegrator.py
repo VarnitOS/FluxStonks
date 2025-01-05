@@ -1,7 +1,7 @@
 from typing import Dict, List
 import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, NewsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import asyncio
 import json
@@ -12,12 +12,9 @@ from dotenv import load_dotenv
 import os
 import ssl
 import websocket
-import aiohttp
-import pandas as pd
-from alpaca.data import DataFeed
 from indicators import TechnicalIndicators
 import pytz
-from pprint import pformat
+from alpaca.data.live import StockDataStream
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -25,11 +22,11 @@ logger = logging.getLogger(__name__)
 
 class MarketDataIntegrator:
     def __init__(self):
-        # Initialize APIs
+        
         API_KEY = os.getenv("ALPACA_KEY")
         API_SECRET = os.getenv("ALPACA_SECRET")
         
-        # Debug log the keys (partially)
+        
         logger.info(f"Initializing Alpaca client with key: {API_KEY[:5]}...")
         
         if not API_KEY or not API_SECRET:
@@ -37,6 +34,14 @@ class MarketDataIntegrator:
             return
             
         self.client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        
+        # Add SDK WebSocket stream
+        self.stream = StockDataStream(API_KEY, API_SECRET)
+        
+        # Setup stream handlers
+        self.stream.subscribe_trades(self.handle_trade)
+        self.stream.subscribe_quotes(self.handle_quote)
+        self.stream.subscribe_bars(self.handle_bar)
         
         # Redis for caching
         self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -59,52 +64,44 @@ class MarketDataIntegrator:
 
         self.news_cache = []
         self.last_news_update = None
-        self.NEWS_CACHE_DURATION = timedelta(minutes=5)  # Cache for 5 minutes
+        self.NEWS_CACHE_DURATION = timedelta(minutes=1)
+        if self.client:
+            if not self.test_connection():
+                logger.error("Failed to establish Alpaca connection")
 
     async def get_stock_data(self, symbol: str) -> Dict:
-        """Get stock data with fallback to last closing price"""
+        """Get stock data with fallback logic"""
         cache_key = f"stock_data:{symbol}"
         
         # Try cache first
         cached_data = self.redis_client.get(cache_key)
         if cached_data:
-            return json.loads(cached_data)
+            data = json.loads(cached_data)
+            data['source'] = 'cache'
+            return data
         
-        try:
-            # Get data from yfinance when market is closed
-            print(f"Fetching data for {symbol}...")  # Debug log
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="1d")
-            
-            print(f"Data received for {symbol}: {not hist.empty}")  # Debug log
-            if not hist.empty:
-                last_row = hist.iloc[-1]
-                print(f"Last row for {symbol}: {last_row}")  # Debug log
-                
-                data = {
-                    "symbol": symbol,
-                    "price": float(last_row['Close']),
-                    "open": float(last_row['Open']),
-                    "high": float(last_row['High']),
-                    "low": float(last_row['Low']),
-                    "volume": int(last_row['Volume']),
-                    "change": float(last_row['Close'] - last_row['Open']),
-                    "change_percent": float((last_row['Close'] - last_row['Open']) / last_row['Open'] * 100),
-                    "timestamp": datetime.now().isoformat()
-                }
-                
-                # Cache for 5 minutes
+        # Try Alpaca first during market hours
+        if await self.is_market_open() and self.can_use_alpaca():
+            data = await self.fetch_alpaca_data(symbol)
+            if data:
                 self.redis_client.setex(cache_key, 300, json.dumps(data))
                 return data
-                
-        except Exception as e:
-            print(f"Detailed error for {symbol}: {str(e)}")  # Debug log
-            return {
-                "symbol": symbol,
-                "price": None,
-                "volume": None,
-                "timestamp": datetime.now().isoformat()
-            }
+        
+        # Fallback to Yahoo
+        data = await self.fetch_yahoo_data(symbol)
+        if data:
+            self.redis_client.setex(cache_key, 300, json.dumps(data))
+            return data
+        
+        # Return error response if both sources fail
+        return {
+            "symbol": symbol,
+            "price": None,
+            "close": None,
+            "volume": None,
+            "timestamp": datetime.now().isoformat(),
+            "source": "error"
+        }
     
     def can_use_alpaca(self) -> bool:
         """Check if we can use Alpaca API based on rate limits"""
@@ -114,53 +111,95 @@ class MarketDataIntegrator:
             self.alpaca_calls = 0
             self.alpaca_last_reset = now
             
-        # Alpaca free tier: 200 calls per minute
-        return self.alpaca_calls < 190  # Buffer of 10
+        return self.alpaca_calls < 190
         
     async def fetch_alpaca_data(self, symbol: str) -> Dict:
-        """Fetch data from Alpaca"""
+        """Fetch data from Alpaca - returns None if data unavailable"""
         try:
-            bars = self.client.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=TimeFrame.Minute,
-                    start=datetime.now() - timedelta(minutes=5)
-                )
-            )
+            logger.info(f"Fetching Alpaca data for {symbol}...")
+            
+            # Get latest trade
+            request = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+            trade_response = self.client.get_stock_latest_trade(request)
+            
+            if not trade_response or symbol not in trade_response:
+                logger.warning(f"No trade data from Alpaca for {symbol}")
+                return None
+            
+            trade = trade_response[symbol]
+            
+            # Get latest quote
+            quote_request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            quote_response = self.client.get_stock_latest_quote(quote_request)
+            quote = quote_response[symbol] if quote_response and symbol in quote_response else None
+            
+            price = float(trade.price)
+            
+            # Use bid price if ask price is 0
+            if quote and quote.ask_price > 0:
+                open_price = float(quote.ask_price)
+            elif quote and quote.bid_price > 0:
+                open_price = float(quote.bid_price)
+            else:
+                open_price = price
+                
+            # Calculate high/low safely
+            high = max(price, float(quote.ask_price if quote and quote.ask_price > 0 else price))
+            low = min(price, float(quote.bid_price if quote and quote.bid_price > 0 else price))
+            
+            # Safe calculation of change percentage
+            change = price - open_price
+            change_percent = (change / open_price * 100) if open_price > 0 else 0
+                
             return {
-                'source': 'alpaca',
-                'price': bars.df.iloc[-1].close if not bars.df.empty else None,
-                'volume': bars.df.iloc[-1].volume if not bars.df.empty else None,
-                'timestamp': datetime.now().isoformat()
+                'symbol': symbol,
+                'price': price,
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'close': price,
+                'volume': int(trade.size),
+                'change': change,
+                'change_percent': change_percent,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'alpaca'
             }
+                
         except Exception as e:
-            self.logger.error(f"Alpaca error for {symbol}: {e}")
-            return await self.fetch_yahoo_data(symbol)  # Fallback to Yahoo
-            
-    async def fetch_yahoo_data(self, symbol: str) -> Dict:
-        """Fetch data from Yahoo Finance"""
-        try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
-            # Get current price using fast_info for more reliable real-time data
-            current_price = ticker.fast_info['lastPrice'] if hasattr(ticker, 'fast_info') else info.get('regularMarketPrice')
-            
-            return {
-                'source': 'yahoo',
-                'price': current_price,
-                'volume': info.get('regularMarketVolume'),
-                'market_cap': info.get('marketCap'),
-                'last_price': info.get('regularMarketPrice'),
-                'open': info.get('regularMarketOpen'),
-                'high': info.get('regularMarketDayHigh'),
-                'low': info.get('regularMarketDayLow'),
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            self.logger.error(f"Yahoo error for {symbol}: {e}")
+            logger.error(f"Error fetching Alpaca data for {symbol}: {str(e)}")
             return None
+
+    async def fetch_yahoo_data(self, symbol: str) -> Dict:
+        """Fetch data from Yahoo Finance - returns None if data unavailable"""
+        try:
+            logger.info(f"Fetching Yahoo data for {symbol}")
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1d")
             
+            if hist.empty:
+                logger.warning(f"No Yahoo data for {symbol}")
+                return None
+            
+            last_row = hist.iloc[-1]
+            
+            return {
+                'symbol': symbol,
+                'price': float(last_row['Close']),
+                'open': float(last_row['Open']),
+                'high': float(last_row['High']),
+                'low': float(last_row['Low']),
+                'close': float(last_row['Close']),
+                'volume': int(last_row['Volume']),
+                'change': float(last_row['Close'] - last_row['Open']),
+                'change_percent': float((last_row['Close'] - last_row['Open']) / last_row['Open'] * 100),
+                'timestamp': datetime.now().isoformat(),
+                'source': 'yahoo'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching Yahoo data for {symbol}: {str(e)}")
+            return None
+
     async def start_websocket_stream(self, symbols: List[str]):
         """Start real-time data stream"""
         # Completely disable all websocket debug logging
@@ -176,7 +215,7 @@ class MarketDataIntegrator:
                     
                     if msg_type == 'success':
                         if msg.get('msg') == 'authenticated':
-                            print("✓ Successfully authenticated")
+                            logger.info("✓ Successfully authenticated")
                             # Only subscribe after successful authentication
                             subscribe_message = {
                                 "action": "subscribe",
@@ -186,12 +225,12 @@ class MarketDataIntegrator:
                             }
                             ws.send(json.dumps(subscribe_message))
                     elif msg_type == 'subscription':
-                        print("✓ Successfully subscribed to market data")
+                        logger.info("✓ Successfully subscribed to market data")
                     elif msg_type == 't':  # Trade
                         symbol = msg.get('S')
                         price = float(msg.get('p', 0))
                         size = float(msg.get('s', 0))
-                        print(f"Trade: {symbol} - Price: ${price:.2f} Size: {size}")
+                        logger.info(f"Trade: {symbol} - Price: ${price:.2f} Size: {size}")
                         self._handle_trade(msg)
                     elif msg_type == 'q':  # Quote
                         symbol = msg.get('S')
@@ -199,25 +238,25 @@ class MarketDataIntegrator:
                         ask = float(msg.get('ap', 0))
                         bid_size = float(msg.get('bs', 0))
                         ask_size = float(msg.get('as', 0))
-                        print(f"Quote: {symbol} - Bid: ${bid:.2f} ({bid_size}) Ask: ${ask:.2f} ({ask_size})")
+                        logger.info(f"Quote: {symbol} - Bid: ${bid:.2f} ({bid_size}) Ask: ${ask:.2f} ({ask_size})")
                         self._handle_quote(msg)
                     elif msg_type == 'b':  # Bar updates
                         symbol = msg.get('S')
                         close = float(msg.get('c', 0))
                         volume = float(msg.get('v', 0))
-                        print(f"Bar: {symbol} - Close: ${close:.2f} Volume: {volume}")
+                        logger.info(f"Bar: {symbol} - Close: ${close:.2f} Volume: {volume}")
             except Exception as e:
-                print(f"Error processing message: {e}")
+                logger.error(f"Error processing message: {e}")
 
         def on_error(ws, error):
-            print(f"WebSocket Error: {error}")
+            logger.error(f"WebSocket Error: {error}")
 
         def on_close(ws, close_status_code, close_msg):
-            print("WebSocket connection closed")
+            logger.info("WebSocket connection closed")
             self.connected = False
 
         def on_open(ws):
-            print("✓ WebSocket connection established")
+            logger.info("✓ WebSocket connection established")
             self.connected = True
             
             # Authenticate first
@@ -231,10 +270,10 @@ class MarketDataIntegrator:
         # Use live trading URL
         ws_url = "wss://stream.data.alpaca.markets/v2/iex"
         
-        print("\nStarting Market Data Stream")
-        print("Note: Data will only be received during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
-        print("Current subscriptions:", ", ".join(symbols))
-        print("-" * 50)
+        logger.info("\nStarting Market Data Stream")
+        logger.info("Note: Data will only be received during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
+        logger.info(f"Current subscriptions: {', '.join(symbols)}")
+        logger.info("-" * 50)
         
         while True:  # Reconnection loop
             try:
@@ -256,16 +295,16 @@ class MarketDataIntegrator:
                 )
                 
                 if not self.connected:
-                    print("Connection lost, attempting to reconnect in 5 seconds...")
+                    logger.warning("Connection lost, attempting to reconnect in 5 seconds...")
                     await asyncio.sleep(5)
                 
             except KeyboardInterrupt:
-                print("\nGracefully shutting down...")
+                logger.info("\nGracefully shutting down...")
                 if self.ws:
                     self.ws.close()
                 break
             except Exception as e:
-                print(f"Connection error: {e}")
+                logger.error(f"Connection error: {e}")
                 await asyncio.sleep(5)
 
     def _handle_trade(self, trade_data):
@@ -283,12 +322,12 @@ class MarketDataIntegrator:
                     300,
                     json.dumps(trade_info)
                 )
-                # Debug print to confirm data is being stored
+                # Debug log to confirm data is being stored
                 cached_data = self.redis_client.get(f"last_trade:{symbol}")
                 if cached_data:
-                    print(f"✓ Trade stored in Redis for {symbol}: {cached_data.decode()}")
+                    logger.info(f"Trade stored in Redis for {symbol}: {cached_data.decode()}")
         except Exception as e:
-            print(f"Error processing trade: {e}")
+            logger.error(f"Error processing trade: {e}")
 
     def _handle_quote(self, quote_data):
         """Handle quote messages synchronously"""
@@ -305,52 +344,82 @@ class MarketDataIntegrator:
                     300,
                     json.dumps(quote_info)
                 )
-                # Debug print to confirm data is being stored
                 cached_data = self.redis_client.get(f"last_quote:{symbol}")
                 if cached_data:
-                    print(f"✓ Quote stored in Redis for {symbol}: {cached_data.decode()}")
+                    logger.info(f"Quote stored in Redis for {symbol}: {cached_data.decode()}")
         except Exception as e:
-            print(f"Error processing quote: {e}")
+            logger.error(f"Error processing quote: {e}")
 
     async def get_historical_bars(self, symbol: str, timeframe: str = "1Min", days: int = 1):
+        """Get historical bar data without market hours constraints."""
         try:
-            # Convert timeframes
-            if timeframe == "1Min":
-                tf = TimeFrame(1, TimeFrameUnit.Minute)
-            elif timeframe == "5Min":
-                tf = TimeFrame(5, TimeFrameUnit.Minute)
-            elif timeframe == "1H":
-                tf = TimeFrame(1, TimeFrameUnit.Hour)
-            elif timeframe == "1D":
-                tf = TimeFrame(1, TimeFrameUnit.Day)
-            
+            logger.info(f"Getting historical bars for {symbol}")
+
+            # Get current time in ET
+            et_tz = pytz.timezone('America/New_York')
+            now = datetime.now(et_tz)
+        
+        # Calculate time range
+            end_dt = now.replace(second=0, microsecond=0)
+            start_dt = end_dt - timedelta(days=days)
+        
+        # Convert timeframe
+            timeframe_map = {
+                "1Min": TimeFrame(1, TimeFrameUnit.Minute),
+                "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+                "1H": TimeFrame(1, TimeFrameUnit.Hour),
+                "1D": TimeFrame(1, TimeFrameUnit.Day)
+            }
+            tf = timeframe_map.get(timeframe)
+
             request = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=tf,
-                feed='iex'
+                start=start_dt,
+                end=end_dt,
+                feed='iex',
+                limit=10000
             )
-            
+        
+            logger.info(f"Requesting data from {start_dt} to {end_dt} ET")
+
             # Get bars
             bars = self.client.get_stock_bars(request)
-            
-            # Format response
+
+            if not bars:
+                logger.warning(f"No bars returned for {symbol}")
+                return []
+        
+        # Format response
             formatted_bars = []
-            if bars and symbol in bars:
-                symbol_bars = bars[symbol]
-                for bar in symbol_bars:
+            if isinstance(bars, dict) and symbol in bars:
+                bars_data = bars[symbol]
+            elif hasattr(bars, 'data'):
+                bars_data = bars.data
+            else:
+                logger.error(f"Unexpected response format: {type(bars)}")
+                return []
+        
+            for bar in bars_data:
+                try:
                     formatted_bars.append({
-                        "timestamp": bar.timestamp.isoformat(),
-                        "open": float(bar.open),
-                        "high": float(bar.high),
-                        "low": float(bar.low),
-                        "close": float(bar.close),
-                        "volume": int(bar.volume)
+                        "timestamp": bar.timestamp.isoformat() if hasattr(bar, 'timestamp') else str(bar.get('t', '')),
+                        "open": float(bar.open if hasattr(bar, 'open') else bar.get('o', 0)),
+                        "high": float(bar.high if hasattr(bar, 'high') else bar.get('h', 0)),
+                        "low": float(bar.low if hasattr(bar, 'low') else bar.get('l', 0)),
+                        "close": float(bar.close if hasattr(bar, 'close') else bar.get('c', 0)),
+                        "volume": int(bar.volume if hasattr(bar, 'volume') else bar.get('v', 0))
                     })
-                
+                except Exception as e:
+                    logger.error(f"Error formatting bar: {e}")
+                    continue
+        
+            logger.info(f"Retrieved {len(formatted_bars)} bars")
             return formatted_bars
-            
+        
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error getting bars: {e}")
+            logger.exception("Full traceback:")
             return []
 
     async def get_latest_bars(self, symbols: List[str]) -> Dict:
@@ -393,7 +462,7 @@ class MarketDataIntegrator:
             return result
             
         except Exception as e:
-            print(f"Error getting bars: {e}")
+            logger.error(f"Error getting bars: {e}")
             return {}
 
     async def get_top_gainers(self) -> List[Dict]:
@@ -423,7 +492,7 @@ class MarketDataIntegrator:
             return top_gainers
             
         except Exception as e:
-            print(f"Error getting top gainers: {e}")
+            logger.error(f"Error getting top gainers: {e}")
             return []
 
     async def get_top_losers(self) -> List[Dict]:
@@ -451,7 +520,7 @@ class MarketDataIntegrator:
             return top_losers
             
         except Exception as e:
-            print(f"Error getting top losers: {e}")
+            logger.error(f"Error getting top losers: {e}")
             return []
 
     async def get_dow_jones_stocks(self) -> List[Dict]:
@@ -473,7 +542,7 @@ class MarketDataIntegrator:
             return dow_data
             
         except Exception as e:
-            print(f"Error getting Dow Jones data: {e}")
+            logger.error(f"Error getting Dow Jones data: {e}")
             return []
 
     async def get_trending_news(self) -> list:
@@ -562,7 +631,7 @@ class MarketDataIntegrator:
             return symbols
             
         except Exception as e:
-            print(f"Error getting market symbols: {e}")
+            logger.error(f"Error getting market symbols: {e}")
             return []
 
     async def get_technical_indicators(self, symbol: str) -> dict:
@@ -646,35 +715,60 @@ class MarketDataIntegrator:
             return {}
 
     async def is_market_open(self) -> bool:
-        """Check if US market is currently open"""
-        try:
-            # Get current time in ET
-            nyc = pytz.timezone('America/New_York')
-            utc_now = datetime.now(pytz.UTC)
-            et_now = utc_now.astimezone(nyc)
-            
-            # Check if it's a holiday (New Year's Day)
-            if et_now.month == 1 and et_now.day == 1:
-                logger.info("Market closed: New Year's Day")
-                return False
-            
-            # Check if it's a weekday
-            if et_now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-                logger.info(f"Market closed: Weekend ({et_now.strftime('%A')})")
-                return False
-            
-            # Market hours are 9:30 AM - 4:00 PM Eastern
-            market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
-            
-            # Check if current time is within market hours
-            is_open = market_open <= et_now <= market_close
-            
-            logger.info(f"Market Status: {'OPEN' if is_open else 'CLOSED'}")
-            logger.info(f"Current time (ET): {et_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            
-            return is_open
-            
-        except Exception as e:
-            logger.error(f"Error checking market status: {e}")
+        return True
+
+    def test_connection(self):
+        """Test Alpaca API connection and permissions."""
+        if not self.client:
+            logger.error("Client not initialized")
             return False
+        
+        try:
+        # Test with a simple request
+            test_request = StockBarsRequest(
+                symbol_or_symbols="AAPL",
+                timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                start=datetime.now(pytz.UTC) - timedelta(days=1),
+                end=datetime.now(pytz.UTC),
+                feed='iex'
+            )
+        
+            result = self.client.get_stock_bars(test_request)
+            logger.info("Successfully connected to Alpaca API")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Alpaca: {e}")
+            return False
+
+    async def handle_trade(self, trade):
+        """Handle incoming trade data"""
+        try:
+            await self._handle_trade({
+                'S': trade.symbol,
+                'p': trade.price,
+                's': trade.size,
+                'timestamp': trade.timestamp
+            })
+        except Exception as e:
+            logger.error(f"Error handling trade: {e}")
+
+    async def handle_quote(self, quote):
+        """Handle incoming quote data"""
+        try:
+            await self._handle_quote({
+                'S': quote.symbol,
+                'bp': quote.bid_price,
+                'ap': quote.ask_price,
+                'bs': quote.bid_size,
+                'as': quote.ask_size
+            })
+        except Exception as e:
+            logger.error(f"Error handling quote: {e}")
+
+    async def handle_bar(self, bar):
+        """Handle incoming bar data"""
+        try:
+            # Use existing bar handling logic
+            pass
+        except Exception as e:
+            logger.error(f"Error handling bar: {e}")
