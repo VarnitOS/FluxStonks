@@ -197,75 +197,43 @@ class MarketDataIntegrator:
             logger.error(f"Error fetching Yahoo data for {symbol}: {str(e)}")
             return None
 
-    async def get_historical_bars(self, symbol: str, timeframe: str = "1Min", days: int = 1):
-        """Get historical bar data without market hours constraints."""
+    async def get_historical_bars(self, symbol: str, timeframe: str = "1d", days: str = "5d"):
+        """Get historical bar data using yfinance."""
         try:
-            logger.info(f"Getting historical bars for {symbol}")
-
-            # Get current time in ET
-            et_tz = pytz.timezone('America/New_York')
-            now = datetime.now(et_tz)
-        
-        # Calculate time range
-            end_dt = now.replace(second=0, microsecond=0)
-            start_dt = end_dt - timedelta(days=days)
-        
-        # Convert timeframe
-            timeframe_map = {
-                "1Min": TimeFrame(1, TimeFrameUnit.Minute),
-                "5Min": TimeFrame(5, TimeFrameUnit.Minute),
-                "1H": TimeFrame(1, TimeFrameUnit.Hour),
-                "1D": TimeFrame(1, TimeFrameUnit.Day)
-            }
-            tf = timeframe_map.get(timeframe)
-
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start_dt,
-                end=end_dt,
-                feed='iex',
-                limit=10000
+            logger.info(f"Getting historical bars for {symbol}, timeframe: {timeframe}, days: {days}")
+            
+            # Create ticker object
+            ticker = yf.Ticker(symbol)
+            
+            # Get historical data
+            hist = ticker.history(
+                period=days,     # e.g., "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"
+                interval=timeframe  # e.g., "1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"
             )
-        
-            logger.info(f"Requesting data from {start_dt} to {end_dt} ET")
-
-            # Get bars
-            bars = self.client.get_stock_bars(request)
-
-            if not bars:
-                logger.warning(f"No bars returned for {symbol}")
+            
+            logger.info(f"Received {len(hist)} bars from Yahoo")
+            
+            if hist.empty:
+                logger.warning(f"No data returned for {symbol}")
                 return []
-        
-        # Format response
+            
+            # Format the response
             formatted_bars = []
-            if isinstance(bars, dict) and symbol in bars:
-                bars_data = bars[symbol]
-            elif hasattr(bars, 'data'):
-                bars_data = bars.data
-            else:
-                logger.error(f"Unexpected response format: {type(bars)}")
-                return []
-        
-            for bar in bars_data:
-                try:
-                    formatted_bars.append({
-                        "timestamp": bar.timestamp.isoformat() if hasattr(bar, 'timestamp') else str(bar.get('t', '')),
-                        "open": float(bar.open if hasattr(bar, 'open') else bar.get('o', 0)),
-                        "high": float(bar.high if hasattr(bar, 'high') else bar.get('h', 0)),
-                        "low": float(bar.low if hasattr(bar, 'low') else bar.get('l', 0)),
-                        "close": float(bar.close if hasattr(bar, 'close') else bar.get('c', 0)),
-                        "volume": int(bar.volume if hasattr(bar, 'volume') else bar.get('v', 0))
-                    })
-                except Exception as e:
-                    logger.error(f"Error formatting bar: {e}")
-                    continue
-        
-            logger.info(f"Retrieved {len(formatted_bars)} bars")
+            for index, row in hist.iterrows():
+                formatted_bars.append({
+                    "timestamp": index.isoformat(),
+                    "open": float(row['Open']),
+                    "high": float(row['High']),
+                    "low": float(row['Low']),
+                    "close": float(row['Close']),
+                    "volume": int(row['Volume'])
+                })
+            
+            logger.info(f"Returning {len(formatted_bars)} bars")
             return formatted_bars
-        
+            
         except Exception as e:
-            logger.error(f"Error getting bars: {e}")
+            logger.error(f"Error getting historical bars: {e}")
             logger.exception("Full traceback:")
             return []
 

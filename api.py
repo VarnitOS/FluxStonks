@@ -5,11 +5,11 @@ import ssl
 import asyncio
 import statistics
 import time
-from typing import Set, Dict
+from typing import Set, Dict, Optional
 import os
 from dotenv import load_dotenv
 import redis
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from MarketDataIntegrator import MarketDataIntegrator
@@ -373,47 +373,49 @@ async def startup_event():
     asyncio.create_task(connect_to_alpaca()) 
 
 @app.get("/api/historical/{symbol}")
-async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
-    """Get historical bar data for a symbol with proper market status."""
+async def get_historical_data(
+    symbol: str,
+    timeframe: str = Query("1d", description="Data interval (1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo)"),
+    days: str = Query("5d", description="Data period (1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max)")
+):
+    """Get historical market data for a symbol."""
+    
+    # Validate timeframe
+    valid_timeframes = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
+    if timeframe not in valid_timeframes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid timeframe. Must be one of: {', '.join(valid_timeframes)}"
+        )
+    
+    # Validate days/period
+    valid_periods = ["1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"]
+    if days not in valid_periods:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period. Must be one of: {', '.join(valid_periods)}"
+        )
+    
     try:
-
-        et_tz = pytz.timezone('America/New_York')
-        now = datetime.now(et_tz)
-        market_open = now.weekday() < 5 and (
-            (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
-            and now.hour < 16
+        data = await mdi.get_historical_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            days=days
         )
         
-
-        data = await mdi.get_historical_bars(symbol, timeframe, days)
+        if not data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No data found for {symbol} with timeframe={timeframe}, days={days}"
+            )
+            
+        return data
         
-        if data and len(data) > 0:
-            first_bar = data[0]["timestamp"]
-            last_bar = data[-1]["timestamp"]
-            
-            return {
-                "status": "success",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "bars_count": len(data),
-                "period": {
-                    "start": first_bar,
-                    "end": last_bar
-                },
-                "current_market_status": "open" if market_open else "closed",
-                "data": data
-            }
-        else:
-            return {
-                "status": "error",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "message": "No data available for the specified period",
-                "current_market_status": "open" if market_open else "closed",
-                "data": []
-            }
-            
     except Exception as e:
-        logger.error(f"Endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+
 
