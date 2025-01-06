@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from MarketDataIntegrator import MarketDataIntegrator
 import pytz
+import asyncio
 
 
 logging.basicConfig(level=logging.INFO)
@@ -51,18 +52,7 @@ SMOOTHING_WINDOW = 10
 # Market hours check
 def is_market_open() -> bool:
     """Check if US stock market is currently open."""
-    now = datetime.now().astimezone()
-    
-    if now.weekday() > 4:
-        return False
-    
-    et_hour = (now.hour - 4) % 24
-    
-    if (et_hour < 9 or et_hour >= 16 or 
-        (et_hour == 9 and now.minute < 30)):
-        return False
-    
-    return True
+    return mdi.is_market_open()
 
 # REST Endpoints
 @app.get("/")
@@ -87,50 +77,7 @@ async def get_stock(symbol: str):
         logger.error(f"Error fetching stock data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/historical/{symbol}")
-async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
-    """Get historical bar data for a symbol with proper market status."""
-    try:
 
-        et_tz = pytz.timezone('America/New_York')
-        now = datetime.now(et_tz)
-        market_open = now.weekday() < 5 and (
-            (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
-            and now.hour < 16
-        )
-        
-
-        data = await mdi.get_historical_bars(symbol, timeframe, days)
-        
-        if data and len(data) > 0:
-            first_bar = data[0]["timestamp"]
-            last_bar = data[-1]["timestamp"]
-            
-            return {
-                "status": "success",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "bars_count": len(data),
-                "period": {
-                    "start": first_bar,
-                    "end": last_bar
-                },
-                "current_market_status": "open" if market_open else "closed",
-                "data": data
-            }
-        else:
-            return {
-                "status": "error",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "message": "No data available for the specified period",
-                "current_market_status": "open" if market_open else "closed",
-                "data": []
-            }
-            
-    except Exception as e:
-        logger.error(f"Endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/market/dow")
 async def get_dow():
@@ -424,3 +371,49 @@ async def websocket_endpoint(websocket: WebSocket):
 async def startup_event():
     """Start Alpaca connection on server startup"""
     asyncio.create_task(connect_to_alpaca()) 
+
+@app.get("/api/historical/{symbol}")
+async def get_historical(symbol: str, timeframe: str = "1Min", days: int = 1):
+    """Get historical bar data for a symbol with proper market status."""
+    try:
+
+        et_tz = pytz.timezone('America/New_York')
+        now = datetime.now(et_tz)
+        market_open = now.weekday() < 5 and (
+            (now.hour > 9 or (now.hour == 9 and now.minute >= 30))
+            and now.hour < 16
+        )
+        
+
+        data = await mdi.get_historical_bars(symbol, timeframe, days)
+        
+        if data and len(data) > 0:
+            first_bar = data[0]["timestamp"]
+            last_bar = data[-1]["timestamp"]
+            
+            return {
+                "status": "success",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "bars_count": len(data),
+                "period": {
+                    "start": first_bar,
+                    "end": last_bar
+                },
+                "current_market_status": "open" if market_open else "closed",
+                "data": data
+            }
+        else:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "message": "No data available for the specified period",
+                "current_market_status": "open" if market_open else "closed",
+                "data": []
+            }
+            
+    except Exception as e:
+        logger.error(f"Endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

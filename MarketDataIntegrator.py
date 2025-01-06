@@ -10,11 +10,9 @@ from datetime import datetime, timedelta, timezone
 import redis
 from dotenv import load_dotenv
 import os
-import ssl
-import websocket
 from indicators import TechnicalIndicators
 import pytz
-from alpaca.data.live import StockDataStream
+import alpaca_trade_api as tradeapi
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -34,14 +32,8 @@ class MarketDataIntegrator:
             return
             
         self.client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        
-        # Add SDK WebSocket stream
-        self.stream = StockDataStream(API_KEY, API_SECRET)
-        
-        # Setup stream handlers
-        self.stream.subscribe_trades(self.handle_trade)
-        self.stream.subscribe_quotes(self.handle_quote)
-        self.stream.subscribe_bars(self.handle_bar)
+        self.api = tradeapi.REST(API_KEY, API_SECRET)
+        self.clock = self.api.get_clock()
         
         # Redis for caching
         self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -81,7 +73,7 @@ class MarketDataIntegrator:
             return data
         
         # Try Alpaca first during market hours
-        if await self.is_market_open() and self.can_use_alpaca():
+        if self.can_use_alpaca():
             data = await self.fetch_alpaca_data(symbol)
             if data:
                 self.redis_client.setex(cache_key, 300, json.dumps(data))
@@ -114,57 +106,62 @@ class MarketDataIntegrator:
         return self.alpaca_calls < 190
         
     async def fetch_alpaca_data(self, symbol: str) -> Dict:
-        """Fetch data from Alpaca - returns None if data unavailable"""
+        """Fetch data from Alpaca with timeout"""
         try:
-            logger.info(f"Fetching Alpaca data for {symbol}...")
-            
-            # Get latest trade
-            request = StockLatestTradeRequest(symbol_or_symbols=[symbol])
-            trade_response = self.client.get_stock_latest_trade(request)
-            
-            if not trade_response or symbol not in trade_response:
-                logger.warning(f"No trade data from Alpaca for {symbol}")
-                return None
-            
-            trade = trade_response[symbol]
-            
-            # Get latest quote
-            quote_request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
-            quote_response = self.client.get_stock_latest_quote(quote_request)
-            quote = quote_response[symbol] if quote_response and symbol in quote_response else None
-            
-            price = float(trade.price)
-            
-            # Use bid price if ask price is 0
-            if quote and quote.ask_price > 0:
-                open_price = float(quote.ask_price)
-            elif quote and quote.bid_price > 0:
-                open_price = float(quote.bid_price)
-            else:
-                open_price = price
+            # Set 5 second timeout
+            async with asyncio.timeout(5):
+                logger.info(f"Fetching Alpaca data for {symbol}...")
                 
-            # Calculate high/low safely
-            high = max(price, float(quote.ask_price if quote and quote.ask_price > 0 else price))
-            low = min(price, float(quote.bid_price if quote and quote.bid_price > 0 else price))
-            
-            # Safe calculation of change percentage
-            change = price - open_price
-            change_percent = (change / open_price * 100) if open_price > 0 else 0
+                # Get latest trade
+                request = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+                trade_response = self.client.get_stock_latest_trade(request)
                 
-            return {
-                'symbol': symbol,
-                'price': price,
-                'open': open_price,
-                'high': high,
-                'low': low,
-                'close': price,
-                'volume': int(trade.size),
-                'change': change,
-                'change_percent': change_percent,
-                'timestamp': datetime.now().isoformat(),
-                'source': 'alpaca'
-            }
+                if not trade_response or symbol not in trade_response:
+                    logger.warning(f"No trade data from Alpaca for {symbol}")
+                    return None
                 
+                trade = trade_response[symbol]
+                
+                # Get latest quote
+                quote_request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+                quote_response = self.client.get_stock_latest_quote(quote_request)
+                quote = quote_response[symbol] if quote_response and symbol in quote_response else None
+                
+                price = float(trade.price)
+                
+                # Use bid price if ask price is 0
+                if quote and quote.ask_price > 0:
+                    open_price = float(quote.ask_price)
+                elif quote and quote.bid_price > 0:
+                    open_price = float(quote.bid_price)
+                else:
+                    open_price = price
+                    
+                # Calculate high/low safely
+                high = max(price, float(quote.ask_price if quote and quote.ask_price > 0 else price))
+                low = min(price, float(quote.bid_price if quote and quote.bid_price > 0 else price))
+                
+                # Safe calculation of change percentage
+                change = price - open_price
+                change_percent = (change / open_price * 100) if open_price > 0 else 0
+                    
+                return {
+                    'symbol': symbol,
+                    'price': price,
+                    'open': open_price,
+                    'high': high,
+                    'low': low,
+                    'close': price,
+                    'volume': int(trade.size),
+                    'change': change,
+                    'change_percent': change_percent,
+                    'timestamp': datetime.now().isoformat(),
+                    'source': 'alpaca'
+                }
+                
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching Alpaca data for {symbol}")
+            return None
         except Exception as e:
             logger.error(f"Error fetching Alpaca data for {symbol}: {str(e)}")
             return None
@@ -199,156 +196,6 @@ class MarketDataIntegrator:
         except Exception as e:
             logger.error(f"Error fetching Yahoo data for {symbol}: {str(e)}")
             return None
-
-    async def start_websocket_stream(self, symbols: List[str]):
-        """Start real-time data stream"""
-        # Completely disable all websocket debug logging
-        logging.getLogger('websocket').setLevel(logging.ERROR)
-        websocket.enableTrace(False)
-        
-        def on_message(ws, message):
-            try:
-                message_data = json.loads(message)
-                if isinstance(message_data, list) and message_data:
-                    msg = message_data[0]
-                    msg_type = msg.get('T')
-                    
-                    if msg_type == 'success':
-                        if msg.get('msg') == 'authenticated':
-                            logger.info("✓ Successfully authenticated")
-                            # Only subscribe after successful authentication
-                            subscribe_message = {
-                                "action": "subscribe",
-                                "trades": symbols,
-                                "quotes": symbols,
-                                "bars": symbols
-                            }
-                            ws.send(json.dumps(subscribe_message))
-                    elif msg_type == 'subscription':
-                        logger.info("✓ Successfully subscribed to market data")
-                    elif msg_type == 't':  # Trade
-                        symbol = msg.get('S')
-                        price = float(msg.get('p', 0))
-                        size = float(msg.get('s', 0))
-                        logger.info(f"Trade: {symbol} - Price: ${price:.2f} Size: {size}")
-                        self._handle_trade(msg)
-                    elif msg_type == 'q':  # Quote
-                        symbol = msg.get('S')
-                        bid = float(msg.get('bp', 0))
-                        ask = float(msg.get('ap', 0))
-                        bid_size = float(msg.get('bs', 0))
-                        ask_size = float(msg.get('as', 0))
-                        logger.info(f"Quote: {symbol} - Bid: ${bid:.2f} ({bid_size}) Ask: ${ask:.2f} ({ask_size})")
-                        self._handle_quote(msg)
-                    elif msg_type == 'b':  # Bar updates
-                        symbol = msg.get('S')
-                        close = float(msg.get('c', 0))
-                        volume = float(msg.get('v', 0))
-                        logger.info(f"Bar: {symbol} - Close: ${close:.2f} Volume: {volume}")
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-
-        def on_error(ws, error):
-            logger.error(f"WebSocket Error: {error}")
-
-        def on_close(ws, close_status_code, close_msg):
-            logger.info("WebSocket connection closed")
-            self.connected = False
-
-        def on_open(ws):
-            logger.info("✓ WebSocket connection established")
-            self.connected = True
-            
-            # Authenticate first
-            auth_data = {
-                "action": "auth",
-                "key": os.getenv("ALPACA_KEY"),
-                "secret": os.getenv("ALPACA_SECRET")
-            }
-            ws.send(json.dumps(auth_data))
-
-        # Use live trading URL
-        ws_url = "wss://stream.data.alpaca.markets/v2/iex"
-        
-        logger.info("\nStarting Market Data Stream")
-        logger.info("Note: Data will only be received during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)")
-        logger.info(f"Current subscriptions: {', '.join(symbols)}")
-        logger.info("-" * 50)
-        
-        while True:  # Reconnection loop
-            try:
-                if self.ws and self.ws.sock and self.ws.sock.connected:
-                    self.ws.close()
-                
-                self.ws = websocket.WebSocketApp(
-                    ws_url,
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close
-                )
-
-                self.ws.run_forever(
-                    sslopt={"cert_reqs": ssl.CERT_NONE},
-                    ping_interval=10,
-                    ping_timeout=5
-                )
-                
-                if not self.connected:
-                    logger.warning("Connection lost, attempting to reconnect in 5 seconds...")
-                    await asyncio.sleep(5)
-                
-            except KeyboardInterrupt:
-                logger.info("\nGracefully shutting down...")
-                if self.ws:
-                    self.ws.close()
-                break
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-                await asyncio.sleep(5)
-
-    def _handle_trade(self, trade_data):
-        """Handle trade messages synchronously"""
-        try:
-            symbol = trade_data.get('S')
-            if symbol:
-                trade_info = {
-                    'price': trade_data.get('p'),
-                    'size': trade_data.get('s'),
-                    'timestamp': datetime.now().isoformat()
-                }
-                self.redis_client.setex(
-                    f"last_trade:{symbol}",
-                    300,
-                    json.dumps(trade_info)
-                )
-                # Debug log to confirm data is being stored
-                cached_data = self.redis_client.get(f"last_trade:{symbol}")
-                if cached_data:
-                    logger.info(f"Trade stored in Redis for {symbol}: {cached_data.decode()}")
-        except Exception as e:
-            logger.error(f"Error processing trade: {e}")
-
-    def _handle_quote(self, quote_data):
-        """Handle quote messages synchronously"""
-        try:
-            symbol = quote_data.get('S')
-            if symbol:
-                quote_info = {
-                    'bid': quote_data.get('bp'),
-                    'ask': quote_data.get('ap'),
-                    'timestamp': datetime.now().isoformat()
-                }
-                self.redis_client.setex(
-                    f"last_quote:{symbol}",
-                    300,
-                    json.dumps(quote_info)
-                )
-                cached_data = self.redis_client.get(f"last_quote:{symbol}")
-                if cached_data:
-                    logger.info(f"Quote stored in Redis for {symbol}: {cached_data.decode()}")
-        except Exception as e:
-            logger.error(f"Error processing quote: {e}")
 
     async def get_historical_bars(self, symbol: str, timeframe: str = "1Min", days: int = 1):
         """Get historical bar data without market hours constraints."""
@@ -422,51 +269,8 @@ class MarketDataIntegrator:
             logger.exception("Full traceback:")
             return []
 
-    async def get_latest_bars(self, symbols: List[str]) -> Dict:
-        """Get latest minute bars for multiple symbols using IEX"""
-        cache_key = f"latest_bars:{','.join(symbols)}"
-        
-        # Try cache first
-        cached = self.redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
-        
-        try:
-            # Get bars from Alpaca with IEX feed
-            bars = self.client.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=symbols,
-                    timeframe=TimeFrame.Minute,
-                    start=datetime.now(timezone.utc) - timedelta(minutes=5),
-                    feed='iex'  # Changed to string 'iex' instead of DataFeed.IEX
-                )
-            )
-            
-            result = {}
-            for symbol in symbols:
-                if symbol in bars:
-                    symbol_bars = bars[symbol]
-                    if len(symbol_bars) > 0:
-                        latest = symbol_bars[-1]
-                        result[symbol] = {
-                            "open": float(latest.open),
-                            "high": float(latest.high),
-                            "low": float(latest.low),
-                            "close": float(latest.close),
-                            "volume": int(latest.volume),
-                            "timestamp": latest.timestamp.isoformat()
-                        }
-            
-            # Cache for 30 seconds
-            self.redis_client.setex(cache_key, 30, json.dumps(result))
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error getting bars: {e}")
-            return {}
-
     async def get_top_gainers(self) -> List[Dict]:
-        """Get top 50 gaining stocks"""
+        """Get top gaining stocks"""
         cache_key = "top_gainers"
         cached = self.redis_client.get(cache_key)
         
@@ -474,12 +278,15 @@ class MarketDataIntegrator:
             return json.loads(cached)
             
         try:
-            # Get market data for all tracked symbols
+            # Get market data for all tracked symbols concurrently
             gainers = []
             symbols = await self.get_market_symbols()
             
-            for symbol in symbols[:100]:  # Limit initial scan
-                data = await self.get_stock_data(symbol)
+            # Use asyncio.gather to fetch data for all symbols concurrently
+            tasks = [self.get_stock_data(symbol) for symbol in symbols[:100]]
+            results = await asyncio.gather(*tasks)
+            
+            for data in results:
                 if data and data.get('change_percent'):
                     gainers.append(data)
             
@@ -496,7 +303,7 @@ class MarketDataIntegrator:
             return []
 
     async def get_top_losers(self) -> List[Dict]:
-        """Get top 50 losing stocks"""
+        """Get top 50 losing stocks with concurrent fetching"""
         cache_key = "top_losers"
         cached = self.redis_client.get(cache_key)
         
@@ -504,14 +311,17 @@ class MarketDataIntegrator:
             return json.loads(cached)
             
         try:
-            # Similar to gainers but sort ascending
-            losers = []
             symbols = await self.get_market_symbols()
             
-            for symbol in symbols[:100]:
-                data = await self.get_stock_data(symbol)
-                if data and data.get('change_percent'):
-                    losers.append(data)
+            # Fetch first 100 symbols concurrently
+            tasks = [self.get_stock_data(symbol) for symbol in symbols[:100]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Filter valid results and sort
+            losers = []
+            for result in results:
+                if isinstance(result, dict) and result.get('change_percent') is not None:
+                    losers.append(result)
             
             losers.sort(key=lambda x: x['change_percent'])
             top_losers = losers[:50]
@@ -524,7 +334,7 @@ class MarketDataIntegrator:
             return []
 
     async def get_dow_jones_stocks(self) -> List[Dict]:
-        """Get Dow Jones Industrial Average stocks"""
+        """Get Dow Jones Industrial Average stocks concurrently"""
         cache_key = "dow_jones"
         cached = self.redis_client.get(cache_key)
         
@@ -532,13 +342,14 @@ class MarketDataIntegrator:
             return json.loads(cached)
             
         try:
-            dow_data = []
-            for symbol in self.dow_symbols:
-                data = await self.get_stock_data(symbol)
-                if data:
-                    dow_data.append(data)
+            # Fetch all Dow stocks concurrently
+            tasks = [self.get_stock_data(symbol) for symbol in self.dow_symbols]
+            results = await asyncio.gather(*tasks)
             
-            self.redis_client.setex(cache_key, 60, json.dumps(dow_data))  # 1 min cache
+            # Filter out any failed requests
+            dow_data = [data for data in results if data]
+            
+            self.redis_client.setex(cache_key, 180, json.dumps(dow_data))  # 3 min cache
             return dow_data
             
         except Exception as e:
@@ -546,73 +357,67 @@ class MarketDataIntegrator:
             return []
 
     async def get_trending_news(self) -> list:
-        """Get market news with caching"""
+        """Get market news with caching and concurrent processing"""
         try:
             now = datetime.now(timezone.utc)
             
-            # Return cached news if fresh (less than 5 minutes old)
+            # Return cached news if fresh
             if (self.last_news_update and 
                 self.news_cache and 
                 now - self.last_news_update < self.NEWS_CACHE_DURATION):
                 logger.info("Returning cached news")
                 return self.news_cache
                 
-            # Otherwise fetch new data
-            logger.info("Fetching fresh news")
-            search = yf.Search(query="stock market")
-            market_news = search.news
-            
-            if not market_news:
-                return self.news_cache if self.news_cache else []  # Return old cache if new fetch fails
+            # Fetch new data with timeout
+            async with asyncio.timeout(10):  # 10 second timeout
+                logger.info("Fetching fresh news")
+                search = yf.Search(query="stock market")
+                market_news = search.news
                 
-            # Process and format news
-            all_news = []
-            for article in market_news:
-                try:
-                    formatted_article = {
-                        "id": str(hash(article['title'])),
-                        "headline": article['title'],
-                        "summary": article.get('summary', ''),
-                        "source": article.get('publisher', 'Yahoo Finance'),
-                        "url": article['link'],
-                        "image_url": article.get('thumbnail', {}).get('resolutions', [{}])[0].get('url', ''),
-                        "timestamp": datetime.fromtimestamp(
-                            article['providerPublishTime'], 
-                            tz=timezone.utc
-                        ).isoformat(),
-                        "category": "Markets",
-                        "tickers": article.get('relatedTickers', [])
-                    }
-                    all_news.append(formatted_article)
-                except KeyError as ke:
-                    logger.error(f"Missing key in article: {ke}")
-                    continue
-            
-            # Update cache
-            self.news_cache = sorted(all_news, key=lambda x: x['timestamp'], reverse=True)[:10]
-            self.last_news_update = now
-            
-            logger.info(f"Updated news cache with {len(self.news_cache)} articles")
-            return self.news_cache
-            
+                if not market_news:
+                    return self.news_cache if self.news_cache else []
+                
+                # Process articles concurrently
+                async def process_article(article):
+                    try:
+                        return {
+                            "id": str(hash(article['title'])),
+                            "headline": article['title'],
+                            "summary": article.get('summary', ''),
+                            "source": article.get('publisher', 'Yahoo Finance'),
+                            "url": article['link'],
+                            "image_url": article.get('thumbnail', {}).get('resolutions', [{}])[0].get('url', ''),
+                            "timestamp": datetime.fromtimestamp(
+                                article['providerPublishTime'], 
+                                tz=timezone.utc
+                            ).isoformat(),
+                            "category": "Markets",
+                            "tickers": article.get('relatedTickers', [])
+                        }
+                    except KeyError as ke:
+                        logger.error(f"Missing key in article: {ke}")
+                        return None
+                
+                # Process all articles concurrently
+                tasks = [process_article(article) for article in market_news]
+                results = await asyncio.gather(*tasks)
+                
+                # Filter out failed articles
+                all_news = [article for article in results if article]
+                
+                # Update cache
+                self.news_cache = sorted(all_news, key=lambda x: x['timestamp'], reverse=True)[:10]
+                self.last_news_update = now
+                
+                logger.info(f"Updated news cache with {len(self.news_cache)} articles")
+                return self.news_cache
+                
+        except asyncio.TimeoutError:
+            logger.error("Timeout fetching news")
+            return self.news_cache if self.news_cache else []
         except Exception as e:
             logger.error(f"Error fetching news: {e}")
-            return self.news_cache if self.news_cache else []  # Return old cache on error
-
-    async def get_batch_stock_data(self, symbols: List[str]) -> Dict[str, Dict]:
-        """Get real-time data for multiple symbols"""
-        result = {}
-        tasks = []
-        
-        for symbol in symbols:
-            tasks.append(self.get_stock_data(symbol))
-        
-        data = await asyncio.gather(*tasks)
-        
-        for i, symbol in enumerate(symbols):
-            result[symbol] = data[i]
-            
-        return result
+            return self.news_cache if self.news_cache else []
 
     async def get_market_symbols(self) -> List[str]:
         """Get list of tradable symbols"""
@@ -714,15 +519,23 @@ class MarketDataIntegrator:
             logger.error(f"Error calculating indicators for {symbol}: {e}")
             return {}
 
-    async def is_market_open(self) -> bool:
-        return True
+    def is_market_open(self) -> bool:
+        """Check if the market is currently open using Alpaca API"""
+        try:
+            clock = self.api.get_clock()
+            is_open = clock.is_open
+            logger.info(f"Market is {'open' if is_open else 'closed'}")
+            return is_open
+        except Exception as e:
+            logger.error(f"Error checking market status: {e}")
+            return False
 
     def test_connection(self):
         """Test Alpaca API connection and permissions."""
         if not self.client:
             logger.error("Client not initialized")
             return False
-        
+       
         try:
         # Test with a simple request
             test_request = StockBarsRequest(
@@ -739,36 +552,3 @@ class MarketDataIntegrator:
         except Exception as e:
             logger.error(f"Failed to connect to Alpaca: {e}")
             return False
-
-    async def handle_trade(self, trade):
-        """Handle incoming trade data"""
-        try:
-            await self._handle_trade({
-                'S': trade.symbol,
-                'p': trade.price,
-                's': trade.size,
-                'timestamp': trade.timestamp
-            })
-        except Exception as e:
-            logger.error(f"Error handling trade: {e}")
-
-    async def handle_quote(self, quote):
-        """Handle incoming quote data"""
-        try:
-            await self._handle_quote({
-                'S': quote.symbol,
-                'bp': quote.bid_price,
-                'ap': quote.ask_price,
-                'bs': quote.bid_size,
-                'as': quote.ask_size
-            })
-        except Exception as e:
-            logger.error(f"Error handling quote: {e}")
-
-    async def handle_bar(self, bar):
-        """Handle incoming bar data"""
-        try:
-            # Use existing bar handling logic
-            pass
-        except Exception as e:
-            logger.error(f"Error handling bar: {e}")
