@@ -42,3 +42,17 @@ Thumbs.db
 
 # Test files
 test_*.png
+Connection:
+GET
+Host:
+User-Agent:
+Accept:
+Accept-Encoding:
+Accept-Language:
+Connection:
+Sec-WebSocket-Extensions:
+Sec-WebSocket-Key:
+Sec-WebSocket-Version:
+Upgrade:
+User-Agent:
+
