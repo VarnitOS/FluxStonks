@@ -396,9 +396,9 @@ class MarketDataIntegrator:
             return json.loads(cached)
             
         try:
-            # This is a placeholder - implement based on your data source
+            # This is a placeholder
             # Could get from Alpaca, Yahoo Finance, or other source
-            symbols = self.dow_symbols  # For now, just return Dow symbols
+            symbols = self.dow_symbols
             
             self.redis_client.setex(cache_key, 86400, json.dumps(symbols))  # 24h cache
             return symbols
