@@ -9,11 +9,11 @@ import RotatingText from './RotatingText'
 import GradientText from './GradientText'
 import StockTable from './StockTable'
 import BacktestCard from './BacktestCard'
+
 export default function HomeContent() {
   return (
     <div className="relative min-h-screen w-full bg-[#0A0B0F]">
       <BackgroundEffects />
-      <Header />
 
       {/* Main Content */}
       <main className="relative w-full px-6 py-6">

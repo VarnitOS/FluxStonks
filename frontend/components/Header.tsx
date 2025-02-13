@@ -59,7 +59,7 @@ export default function Header() {
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search..."
+                  placeholder="Search a Ticker..."
                   className="w-full bg-[#252630]/60 text-white placeholder-white/50 pl-12 pr-4 py-3 rounded-xl border border-white/8 focus:border-white/20 focus:bg-[#252630]/80 focus:outline-none transition-all duration-300"
                 />
               </div>
